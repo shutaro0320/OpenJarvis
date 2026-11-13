@@ -1,9 +1,9 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip, Search } from 'lucide-react';
+import { Send, Square, Paperclip, Search, AudioLines } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch } from '../../lib/sse';
-import { fetchSavings, getBase } from '../../lib/api';
+import { fetchSavings, getBase, transcribeAudio } from '../../lib/api';
 import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
 import { serializeToolCallArguments } from '../../lib/tool-call';
 import {
@@ -12,6 +12,35 @@ import {
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
+import { useTts } from '../../hooks/useTts';
+import { useTtsStore } from '../../lib/tts';
+import { listenOnce, speechLanguage } from '../../lib/voice-listen';
+
+type VoicePhase = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
+
+const VOICE_PHASE_LABEL: Record<VoicePhase, string> = {
+  idle: '',
+  listening: '聞いています… 話し終えると自動で送信します',
+  transcribing: '文字起こし中…',
+  thinking: '考えています…',
+  speaking: '話しています（クリックでスキップ）',
+};
+
+/** Resolve once voice output has gone quiet (finished, skipped or failed). */
+function waitForTtsIdle(): Promise<void> {
+  return new Promise((resolve) => {
+    if (useTtsStore.getState().state === 'idle') {
+      resolve();
+      return;
+    }
+    const unsub = useTtsStore.subscribe((s) => {
+      if (s.state === 'idle') {
+        unsub();
+        resolve();
+      }
+    });
+  });
+}
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -84,6 +113,13 @@ export function InputArea() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Hands-free voice conversation: listen -> transcribe -> send -> speak -> repeat.
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>('idle');
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const voiceModeRef = useRef(false);
+  const listenAbortRef = useRef<AbortController | null>(null);
 
   const activeId = useAppStore((s) => s.activeId);
   const selectedModel = useAppStore((s) => s.selectedModel);
@@ -171,8 +207,10 @@ export function InputArea() {
     resetStream();
   }, [resetStream]);
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
+  const sendMessage = useCallback(async (spoken?: unknown) => {
+    // Voice conversation passes the transcript directly; button/keyboard
+    // sends use the textarea (onClick passes an event, which is ignored).
+    const content = (typeof spoken === 'string' ? spoken : input).trim();
     if (!content || streamState.isStreaming) return;
     if (!selectedModel) {
       toast.error('Pick a model first (⌘K)');
@@ -196,10 +234,20 @@ export function InputArea() {
 
     // Build API messages before adding assistant placeholder
     const currentMessages = useAppStore.getState().messages;
-    const apiMessages = currentMessages.map((m) => ({
+    const apiMessages: Array<{ role: string; content: string }> = currentMessages.map((m) => ({
       role: m.role,
       content: m.content,
     }));
+    if (voiceModeRef.current) {
+      // Replies will be read aloud: keep them short and conversational.
+      apiMessages.unshift({
+        role: 'system',
+        content:
+          'This is a spoken voice conversation. The reply will be read aloud by text-to-speech, '
+          + 'so answer briefly and naturally, in plain sentences in the user\'s language, '
+          + 'without Markdown, lists, tables, code blocks, URLs or emoji.',
+      });
+    }
 
     const assistantMsg: ChatMessage = {
       id: generateId(),
@@ -554,6 +602,80 @@ export function InputArea() {
     maxTokens,
   ]);
 
+  // ---- Voice conversation loop -------------------------------------------
+  const { available: ttsAvailable } = useTts();
+  const sendRef = useRef(sendMessage);
+  sendRef.current = sendMessage;
+  const voiceAvailable = speechAvailable && ttsAvailable && !!selectedModel;
+
+  const runVoiceLoop = useCallback(async () => {
+    while (voiceModeRef.current) {
+      setVoicePhase('listening');
+      const ac = new AbortController();
+      listenAbortRef.current = ac;
+      let blob: Blob | null;
+      try {
+        blob = await listenOnce({ signal: ac.signal, onLevel: setVoiceLevel });
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Microphone access denied');
+        break;
+      }
+      if (!voiceModeRef.current) break;
+      if (!blob) continue; // nobody spoke -- keep listening
+
+      setVoicePhase('transcribing');
+      let text = '';
+      try {
+        text = (await transcribeAudio(blob, 'voice.webm', speechLanguage())).text.trim();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Transcription failed');
+        continue;
+      }
+      if (!voiceModeRef.current) break;
+      if (!text) continue;
+
+      setVoicePhase('thinking');
+      await sendRef.current(text);
+      if (!voiceModeRef.current) break;
+
+      const msgs = useAppStore.getState().messages;
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant' && last.content) {
+        setVoicePhase('speaking');
+        const tts = useTtsStore.getState();
+        tts.markAutoSpoken(last.id); // keep chat autoplay from speaking it twice
+        if (tts.speakingId !== last.id) await tts.speak(last.id, last.content);
+        await waitForTtsIdle();
+      }
+    }
+    listenAbortRef.current = null;
+    setVoiceLevel(0);
+    setVoicePhase('idle');
+    if (voiceModeRef.current) {
+      voiceModeRef.current = false;
+      setVoiceMode(false);
+    }
+  }, []);
+
+  const toggleVoiceMode = useCallback(() => {
+    if (voiceModeRef.current) {
+      voiceModeRef.current = false;
+      setVoiceMode(false);
+      listenAbortRef.current?.abort();
+      useTtsStore.getState().stop();
+      return;
+    }
+    voiceModeRef.current = true;
+    setVoiceMode(true);
+    void runVoiceLoop();
+  }, [runVoiceLoop]);
+
+  // Leaving the chat view ends the conversation cleanly.
+  useEffect(() => () => {
+    voiceModeRef.current = false;
+    listenAbortRef.current?.abort();
+  }, []);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -614,6 +736,33 @@ export function InputArea() {
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}
           disabled={streamState.isStreaming || modelLoading}
         />
+        <button
+          type="button"
+          onClick={toggleVoiceMode}
+          disabled={!voiceMode && (!voiceAvailable || streamState.isStreaming)}
+          aria-pressed={voiceMode}
+          title={
+            voiceMode
+              ? '音声会話を終了'
+              : !selectedModel
+                ? 'Pick a model first (⌘K)'
+                : !speechAvailable
+                  ? '音声認識が使えません（Speech backend not configured）'
+                  : !ttsAvailable
+                    ? '読み上げが使えません（No text-to-speech backend）'
+                    : '音声会話を開始（ハンズフリー）'
+          }
+          className="p-2 rounded-xl transition-all shrink-0 cursor-pointer disabled:cursor-default disabled:opacity-30"
+          style={{
+            background: voiceMode ? 'var(--color-accent)' : 'transparent',
+            color: voiceMode ? 'white' : 'var(--color-text-secondary)',
+            boxShadow: voiceMode && voicePhase === 'listening'
+              ? `0 0 0 ${2 + Math.round(voiceLevel * 10)}px var(--color-accent-subtle)`
+              : 'none',
+          }}
+        >
+          <AudioLines size={16} />
+        </button>
         {isCurrentChatStreaming ? (
           <button
             onClick={stopStreaming}
@@ -647,10 +796,24 @@ export function InputArea() {
         )}
       </div>
       <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+        {voiceMode ? (
+          <button
+            type="button"
+            onClick={() => voicePhase === 'speaking' && useTtsStore.getState().stop()}
+            className="bg-transparent"
+            style={{
+              color: 'var(--color-accent)',
+              cursor: voicePhase === 'speaking' ? 'pointer' : 'default',
+            }}
+          >
+            {VOICE_PHASE_LABEL[voicePhase] || '音声会話中'}
+          </button>
+        ) : (
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
+        )}
       </div>
     </div>
   );
