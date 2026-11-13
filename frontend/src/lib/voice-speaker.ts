@@ -29,7 +29,11 @@ export class SentenceSpeaker {
   /** Text that was actually sent to speech (for echo detection). */
   spokenText = '';
 
-  constructor(private readonly onStart?: () => void) {
+  constructor(
+    private readonly onStart?: () => void,
+    /** Each audio element before it plays (e.g. to visualise the voice). */
+    private readonly onAudio?: (el: HTMLAudioElement) => void,
+  ) {
     this.idle = new Promise((resolve) => {
       this.idleResolve = resolve;
     });
@@ -124,6 +128,7 @@ export class SentenceSpeaker {
       this.url = URL.createObjectURL(blob);
       const el = new Audio(this.url);
       this.audio = el;
+      this.onAudio?.(el);
       const done = () => {
         el.onended = null;
         el.onerror = null;
