@@ -7,6 +7,8 @@ export interface ChatRequest {
   stream: true;
   temperature?: number;
   max_tokens?: number;
+  /** Bypass the server agent and stream model tokens directly. */
+  direct?: boolean;
 }
 
 export async function* streamChat(

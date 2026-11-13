@@ -13,6 +13,7 @@ Environment overrides:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Dict, List
@@ -120,95 +122,183 @@ def _render_prompt(messages: Sequence[Message]) -> tuple[str, str]:
     return system, "\n".join(lines)
 
 
-@EngineRegistry.register("claude_subscription")
-class ClaudeSubscriptionEngine(InferenceEngine):
-    """Chat via the user's Claude subscription through the Claude Code CLI."""
+_FIXED_SYSTEM_PROMPT = (
+    "The user's message begins with <system_instructions>. Treat those "
+    "instructions exactly as your system prompt, then answer the rest of the "
+    "message directly. Never mention the tags."
+)
+# A pre-started process skips ~3s of CLI start-up. Idle ones are recycled so
+# a stale auth token or CLI update is picked up.
+_WARM_MAX_AGE = float(os.environ.get("OPENJARVIS_CLAUDE_WARM_SECONDS", "600"))
 
-    engine_id = "claude_subscription"
-    is_cloud = True
 
-    def __init__(self, cli_path: str | None = None, timeout: float | None = None) -> None:
-        self._cli = cli_path or find_claude_cli()
-        self._timeout = timeout or float(os.environ.get("OPENJARVIS_CLAUDE_TIMEOUT", "600"))
-        self._workdir = Path(tempfile.gettempdir()) / "openjarvis-claude-sub"
+class _Worker:
+    """One ``claude -p --input-format stream-json`` process serving one request."""
 
-    # ------------------------------------------------------------------ helpers
-    def _command(self, model: str, system_file: Path) -> List[str]:
-        if not self._cli:
-            raise EngineConnectionError(
-                "Claude Code CLI not found. Install Claude Code and run `claude` "
-                "once to log in, or set OPENJARVIS_CLAUDE_CLI."
-            )
-        return [
-            self._cli,
-            "-p",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--model", MODEL_ALIASES.get(model, model),
-            "--tools", "",
-            "--strict-mcp-config",
-            "--setting-sources", "",
-            "--no-session-persistence",
-            "--system-prompt-file", str(system_file),
-        ]
-
-    def _events(self, messages: Sequence[Message], model: str) -> Iterator[Dict[str, Any]]:
-        """Run the CLI and yield its stream-json events."""
-        system, prompt = _render_prompt(messages)
-        self._workdir.mkdir(parents=True, exist_ok=True)
-        fd, sys_path = tempfile.mkstemp(suffix=".txt", dir=self._workdir)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(system)
-
+    def __init__(self, cli: str, alias: str) -> None:
+        workdir = Path(tempfile.gettempdir()) / "openjarvis-claude-sub"
+        workdir.mkdir(parents=True, exist_ok=True)
+        sys_file = workdir / "system_prompt.txt"
+        if not sys_file.exists() or sys_file.read_text(encoding="utf-8") != _FIXED_SYSTEM_PROMPT:
+            sys_file.write_text(_FIXED_SYSTEM_PROMPT, encoding="utf-8")
         env = os.environ.copy()
         # Force subscription (OAuth) auth rather than API-key billing.
         env.pop("ANTHROPIC_API_KEY", None)
         kwargs: Dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        self._stderr = tempfile.TemporaryFile()
+        self.alias = alias
+        self.started = time.monotonic()
+        self.proc = subprocess.Popen(
+            [
+                cli, "-p",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--model", alias,
+                "--tools", "",
+                "--strict-mcp-config",
+                "--setting-sources", "",
+                "--no-session-persistence",
+                "--system-prompt-file", str(sys_file),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            cwd=str(workdir),
+            env=env,
+            **kwargs,
+        )
 
+    def fresh(self) -> bool:
+        return self.proc.poll() is None and time.monotonic() - self.started < _WARM_MAX_AGE
+
+    def stderr_text(self) -> str:
         try:
-            proc = subprocess.Popen(
-                self._command(model, Path(sys_path)),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(self._workdir),
-                env=env,
-                **kwargs,
+            self._stderr.seek(0)
+            return self._stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    def close(self) -> None:
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        if self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        self._stderr.close()
+
+
+class _WarmPool:
+    """Keeps one idle, already-started CLI process per model alias."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: Dict[str, _Worker] = {}
+        atexit.register(self.shutdown)
+
+    def warm(self, cli: str, alias: str) -> None:
+        with self._lock:
+            current = self._idle.get(alias)
+            if current is not None and current.fresh():
+                return
+            if current is not None:
+                current.close()
+            try:
+                self._idle[alias] = _Worker(cli, alias)
+            except OSError:
+                logger.debug("Could not pre-start Claude CLI", exc_info=True)
+                self._idle.pop(alias, None)
+
+    def take(self, cli: str, alias: str) -> _Worker:
+        with self._lock:
+            worker = self._idle.pop(alias, None)
+        if worker is None or not worker.fresh():
+            if worker is not None:
+                worker.close()
+            worker = _Worker(cli, alias)
+        # Start the replacement now so the next turn is warm too.
+        threading.Thread(target=self.warm, args=(cli, alias), daemon=True).start()
+        return worker
+
+    def shutdown(self) -> None:
+        with self._lock:
+            workers, self._idle = list(self._idle.values()), {}
+        for w in workers:
+            w.close()
+
+
+_POOL = _WarmPool()
+_PREWARM_ALIASES = tuple(
+    a for a in os.environ.get("OPENJARVIS_CLAUDE_PREWARM", "sonnet,haiku").split(",") if a
+)
+
+
+@EngineRegistry.register("claude_subscription")
+class ClaudeSubscriptionEngine(InferenceEngine):
+    """Chat via the user's Claude subscription through the Claude Code CLI."""
+
+    engine_id = "claude_subscription"
+    # Runs through a local CLI process; marking it cloud would make the stream
+    # route treat it as mis-routed and fall back to a local Ollama.
+    is_cloud = False
+
+    def __init__(self, cli_path: str | None = None, timeout: float | None = None) -> None:
+        self._cli = cli_path or find_claude_cli()
+        self._timeout = timeout or float(os.environ.get("OPENJARVIS_CLAUDE_TIMEOUT", "600"))
+
+    # ------------------------------------------------------------------ helpers
+    def _events(self, messages: Sequence[Message], model: str) -> Iterator[Dict[str, Any]]:
+        """Send one request to a (pre-started) CLI process and yield its events."""
+        if not self._cli:
+            raise EngineConnectionError(
+                "Claude Code CLI not found. Install Claude Code and run `claude` "
+                "once to log in, or set OPENJARVIS_CLAUDE_CLI."
             )
+        system, prompt = _render_prompt(messages)
+        content = f"<system_instructions>\n{system}\n</system_instructions>\n\n{prompt}"
+        alias = MODEL_ALIASES.get(model, model)
+        try:
+            worker = _POOL.take(self._cli, alias)
         except OSError as exc:
-            os.unlink(sys_path)
             raise EngineConnectionError(f"Failed to start Claude Code CLI: {exc}") from exc
+        proc = worker.proc
 
         timer = threading.Timer(self._timeout, proc.kill)
         timer.start()
         try:
-            assert proc.stdin and proc.stdout and proc.stderr
-            proc.stdin.write(prompt.encode("utf-8"))
-            proc.stdin.close()
+            assert proc.stdin and proc.stdout
+            line = json.dumps({"type": "user", "message": {"role": "user", "content": content}})
+            proc.stdin.write((line + "\n").encode("utf-8"))
+            proc.stdin.flush()
             for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line.startswith("{"):
+                text = raw.decode("utf-8", errors="replace").strip()
+                if not text.startswith("{"):
                     continue
                 try:
-                    yield json.loads(line)
+                    event = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-            rc = proc.wait()
-            if rc != 0:
-                err = proc.stderr.read().decode("utf-8", errors="replace").strip()
-                if err:
-                    raise EngineConnectionError(f"Claude Code CLI exited {rc}: {err[-800:]}")
+                yield event
+                if event.get("type") == "result":
+                    break
+            else:
+                rc = proc.wait()
+                err = worker.stderr_text()
+                raise EngineConnectionError(
+                    f"Claude Code CLI exited {rc} without a result: {err[-800:]}"
+                )
         finally:
             timer.cancel()
-            if proc.poll() is None:
-                proc.kill()
-            try:
-                os.unlink(sys_path)
-            except OSError:
-                pass
+            worker.close()
 
     @staticmethod
     def _check_result(event: Dict[str, Any]) -> None:
@@ -302,13 +392,24 @@ class ClaudeSubscriptionEngine(InferenceEngine):
                     yield item["result"]
 
     def list_models(self) -> List[str]:
-        return list(MODEL_ALIASES) if self._cli else []
+        if not self._cli:
+            return []
+        # Model-list requests mean someone is about to chat: pre-start the
+        # default (Sonnet) and the fast voice model (Haiku) in the background.
+        for alias in _PREWARM_ALIASES:
+            threading.Thread(target=_POOL.warm, args=(self._cli, alias), daemon=True).start()
+        return list(MODEL_ALIASES)
 
     def health(self) -> bool:
         return bool(self._cli)
 
     def can_serve(self, model: str) -> bool:
         return model in MODEL_ALIASES
+
+    def prepare(self, model: str) -> None:
+        """Pre-start a CLI process so the first reply skips start-up time."""
+        if self._cli and model in MODEL_ALIASES:
+            _POOL.warm(self._cli, MODEL_ALIASES[model])
 
 
 __all__ = ["ClaudeSubscriptionEngine", "MODEL_ALIASES", "find_claude_cli"]

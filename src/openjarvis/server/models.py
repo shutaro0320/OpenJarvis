@@ -28,6 +28,9 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = 1024
     stream: bool = False
     tools: Optional[List[Dict[str, Any]]] = None
+    # Skip the server-side agent loop and stream the model's tokens directly
+    # (used by voice conversation, where time-to-first-word matters most).
+    direct: bool = False
 
 
 # ---------------------------------------------------------------------------

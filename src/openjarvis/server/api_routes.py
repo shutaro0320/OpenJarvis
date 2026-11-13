@@ -1166,7 +1166,7 @@ async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
 
     return Response(
         content=result.audio,
-        media_type="audio/wav",
+        media_type="audio/mpeg" if result.format == "mp3" else "audio/wav",
         headers={
             "X-Voice-Id": result.voice_id or voice_id,
             "X-Sample-Rate": str(result.sample_rate),

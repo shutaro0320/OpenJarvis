@@ -17,14 +17,28 @@ export interface ListenOptions {
   maxMs?: number;
   /** Optional 0..1 input level callback, for a meter. */
   onLevel?: (level: number) => void;
+  /** Called once when speech is first detected (used for barge-in). */
+  onSpeechStart?: () => void;
+  /** Sustained voice needed to count as speech (raise while audio plays). */
+  minSpeechMs?: number;
+  /** Speech threshold as a multiple of the calibrated noise floor. */
+  thresholdFactor?: number;
 }
 
 const TICK_MS = 50;
 const CALIBRATE_MS = 400;
-const MIN_SPEECH_MS = 250;
 
 export async function listenOnce(opts: ListenOptions = {}): Promise<Blob | null> {
-  const { signal, silenceMs = 1200, noSpeechMs = 15000, maxMs = 60000, onLevel } = opts;
+  const {
+    signal,
+    silenceMs = 1200,
+    noSpeechMs = 15000,
+    maxMs = 60000,
+    onLevel,
+    onSpeechStart,
+    minSpeechMs = 250,
+    thresholdFactor = 2.5,
+  } = opts;
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error('Microphone not supported in this browser');
   }
@@ -92,13 +106,16 @@ export async function listenOnce(opts: ListenOptions = {}): Promise<Blob | null>
         return;
       }
       if (floorN) {
-        threshold = Math.max(0.012, (floorSum / floorN) * 2.5);
+        threshold = Math.max(0.012, (floorSum / floorN) * thresholdFactor);
         floorN = 0;
       }
 
       if (rms > threshold) {
         voicedMs += TICK_MS;
-        if (voicedMs >= MIN_SPEECH_MS) speaking = true;
+        if (!speaking && voicedMs >= minSpeechMs) {
+          speaking = true;
+          onSpeechStart?.();
+        }
         lastVoice = now;
       } else if (!speaking) {
         voicedMs = Math.max(0, voicedMs - TICK_MS);

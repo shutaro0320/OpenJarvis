@@ -16,6 +16,7 @@ for _mod in (
     "kokoro_tts",
     "openai_tts",
     "system_tts",
+    "edge_tts_backend",
 ):
     try:
         importlib.import_module(f".{_mod}", __name__)

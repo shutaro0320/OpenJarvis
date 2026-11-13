@@ -183,6 +183,8 @@ speech = [
     "numpy>=1.24",
     "sounddevice>=0.5",
     "soundfile>=0.12",
+    # Natural Japanese/English voices for voice conversation (online, no key).
+    "edge-tts>=7.2",
 ]
 speech-deepgram = ["deepgram-sdk>=3.0"]
 eval-wandb = ["wandb>=0.17"]

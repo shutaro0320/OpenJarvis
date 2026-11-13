@@ -164,6 +164,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     use_server_agent = (
         agent is not None
         and not request_body.tools
+        and not request_body.direct
         and (not request_body.stream or bool(getattr(agent, "_tools", None)))
     )
 

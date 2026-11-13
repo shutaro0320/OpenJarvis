@@ -17,7 +17,16 @@ logger = logging.getLogger(__name__)
 
 # Priority order: local first, then cloud.
 # "system" (OS built-in voices) is the zero-install last resort.
-TTS_BACKEND_ORDER = ("kokoro", "openai_tts", "cartesia", "elevenlabs", "system")
+# "edge" (free neural voices, online, good Japanese) comes before "system"
+# and falls back to it by itself when offline.
+TTS_BACKEND_ORDER = (
+    "kokoro",
+    "openai_tts",
+    "cartesia",
+    "elevenlabs",
+    "edge",
+    "system",
+)
 
 # Voice IDs are backend-specific and NOT portable. ``speech.voice_id`` applies
 # only to ``speech.tts_backend``; if synthesis falls back to another backend we
@@ -28,6 +37,7 @@ BACKEND_DEFAULT_VOICE = {
     "cartesia": "",  # no safe static default; let Cartesia choose
     "elevenlabs": "JBFqnCBsd6RMkjVDRZzb",  # "George", British male
     "system": "",  # pick by text language (e.g. Haruka / Kyoko for Japanese)
+    "edge": "",  # pick by text language (ja-JP-KeitaNeural / en-GB-RyanNeural)
 }
 
 

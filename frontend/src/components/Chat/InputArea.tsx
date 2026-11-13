@@ -15,32 +15,33 @@ import { useSpeech } from '../../hooks/useSpeech';
 import { useTts } from '../../hooks/useTts';
 import { useTtsStore } from '../../lib/tts';
 import { listenOnce, speechLanguage } from '../../lib/voice-listen';
+import { SentenceSpeaker, looksLikeEcho } from '../../lib/voice-speaker';
 
-type VoicePhase = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
+type VoicePhase = 'idle' | 'standby' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
 
 const VOICE_PHASE_LABEL: Record<VoicePhase, string> = {
   idle: '',
+  standby: '待機中…「ジャービス」と呼びかけてください',
   listening: '聞いています… 話し終えると自動で送信します',
-  transcribing: '文字起こし中…',
+  transcribing: '聞き取り中…',
   thinking: '考えています…',
-  speaking: '話しています（クリックでスキップ）',
+  speaking: '話しています（話しかけると止まります／クリックでスキップ）',
 };
 
-/** Resolve once voice output has gone quiet (finished, skipped or failed). */
-function waitForTtsIdle(): Promise<void> {
-  return new Promise((resolve) => {
-    if (useTtsStore.getState().state === 'idle') {
-      resolve();
-      return;
-    }
-    const unsub = useTtsStore.subscribe((s) => {
-      if (s.state === 'idle') {
-        unsub();
-        resolve();
-      }
-    });
-  });
-}
+/** Persona + speaking style for voice mode. */
+const JARVIS_PROMPT =
+  'あなたは「ジャービス（JARVIS）」、ユーザー専属の有能なAI執事です。'
+  + '落ち着いた丁寧な口調（です・ます調）で、ときに控えめで品のあるユーモアを交えて話します。'
+  + 'これは音声会話で、返答はそのまま音声で読み上げられます。'
+  + '要点を短く、通常は1〜3文の自然な話し言葉で答えてください。'
+  + 'Markdown、箇条書き、表、コード、URL、絵文字、記号の羅列は使わないでください。'
+  + 'ユーザーが英語で話した場合は英語で答えてください。';
+
+// Whisper spells the name many ways; accept the common ones.
+const WAKE_WORD = /(ジャ[ー〜]?[ビヴ][ィイ]?[スズ]|じゃ[ー〜]?[びゔ]い?す|ジャーベス|ジャービー|jarvis)/i;
+const END_PHRASE = /^(おやすみ(なさい)?|終わり|おわり|終了|以上|さようなら|もう大丈夫|ストップ)(です)?$/;
+/** Quiet this long in an active conversation -> back to wake-word standby. */
+const ACTIVE_TIMEOUT_MS = 20000;
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -240,13 +241,7 @@ export function InputArea() {
     }));
     if (voiceModeRef.current) {
       // Replies will be read aloud: keep them short and conversational.
-      apiMessages.unshift({
-        role: 'system',
-        content:
-          'This is a spoken voice conversation. The reply will be read aloud by text-to-speech, '
-          + 'so answer briefly and naturally, in plain sentences in the user\'s language, '
-          + 'without Markdown, lists, tables, code blocks, URLs or emoji.',
-      });
+      apiMessages.unshift({ role: 'system', content: JARVIS_PROMPT });
     }
 
     const assistantMsg: ChatMessage = {
@@ -424,7 +419,14 @@ export function InputArea() {
         }
       } else {
       for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        {
+          model: selectedModel,
+          messages: apiMessages,
+          stream: true,
+          temperature,
+          max_tokens: maxTokens,
+          ...(voiceModeRef.current ? { direct: true } : {}),
+        },
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -608,20 +610,48 @@ export function InputArea() {
   sendRef.current = sendMessage;
   const voiceAvailable = speechAvailable && ttsAvailable && !!selectedModel;
 
+  const speakerRef = useRef<SentenceSpeaker | null>(null);
+
   const runVoiceLoop = useCallback(async () => {
-    while (voiceModeRef.current) {
-      setVoicePhase('listening');
+    // 'active': in a conversation, every utterance is sent.
+    // 'standby': only utterances containing the wake word ("ジャービス") count.
+    let stage: 'active' | 'standby' = 'active';
+    let pending: Blob | null = null; // speech captured by a barge-in
+    let echoOf = ''; // what we were saying when that barge-in happened
+
+    const listen = (opts: Parameters<typeof listenOnce>[0]) => {
       const ac = new AbortController();
       listenAbortRef.current = ac;
-      let blob: Blob | null;
-      try {
-        blob = await listenOnce({ signal: ac.signal, onLevel: setVoiceLevel });
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Microphone access denied');
-        break;
+      return listenOnce({ signal: ac.signal, onLevel: setVoiceLevel, ...opts });
+    };
+    const say = async (phrase: string) => {
+      const sp = new SentenceSpeaker(() => setVoicePhase('speaking'));
+      speakerRef.current = sp;
+      await sp.sayAndFinish(phrase);
+      speakerRef.current = null;
+    };
+
+    while (voiceModeRef.current) {
+      let blob: Blob | null = pending;
+      pending = null;
+      const echoCheck = echoOf;
+      echoOf = '';
+      if (!blob) {
+        setVoicePhase(stage === 'standby' ? 'standby' : 'listening');
+        try {
+          blob = await listen(stage === 'standby'
+            ? { noSpeechMs: 60000, silenceMs: 900 }
+            : { noSpeechMs: ACTIVE_TIMEOUT_MS });
+        } catch (err) {
+          toast.error(err instanceof Error ? err.message : 'Microphone access denied');
+          break;
+        }
+        if (!voiceModeRef.current) break;
+        if (!blob) {
+          stage = 'standby'; // conversation went quiet: wait for the wake word
+          continue;
+        }
       }
-      if (!voiceModeRef.current) break;
-      if (!blob) continue; // nobody spoke -- keep listening
 
       setVoicePhase('transcribing');
       let text = '';
@@ -632,23 +662,81 @@ export function InputArea() {
         continue;
       }
       if (!voiceModeRef.current) break;
-      if (!text) continue;
+      if (!text || (echoCheck && looksLikeEcho(text, echoCheck))) continue;
 
+      if (stage === 'standby') {
+        const m = WAKE_WORD.exec(text);
+        if (!m) continue;
+        stage = 'active';
+        const rest = text.slice(m.index + m[0].length).replace(/^[\s、。,.!！?？]+/, '');
+        if (rest.replace(/[\s、。,.!！?？]/g, '').length < 2) {
+          await say('はい、お呼びでしょうか。');
+          continue;
+        }
+        text = rest; // "ジャービス、明日の天気は？" -> ask right away
+      }
+      if (END_PHRASE.test(text.replace(/[\s、。,.!！?？]/g, ''))) {
+        await say('かしこまりました。また何かあればお呼びください。');
+        stage = 'standby';
+        continue;
+      }
+
+      // ---- One turn: stream the reply and speak it sentence by sentence.
       setVoicePhase('thinking');
-      await sendRef.current(text);
-      if (!voiceModeRef.current) break;
+      // Mutated from callbacks, so kept in an object (TS cannot track closures).
+      const barge: { hit: boolean; promise: Promise<Blob | null> | null } = { hit: false, promise: null };
+      const bargeAc = new AbortController();
+      const speaker: SentenceSpeaker = new SentenceSpeaker(() => {
+        // Audio is playing: listen for the user talking over it.
+        barge.promise = listenOnce({
+          signal: bargeAc.signal,
+          onLevel: setVoiceLevel,
+          minSpeechMs: 400,
+          thresholdFactor: 3,
+          noSpeechMs: 10 * 60 * 1000,
+          onSpeechStart: () => {
+            barge.hit = true;
+            speaker.stop();
+            abortRef.current?.abort(); // stop generating too
+            setVoicePhase('listening');
+          },
+        }).catch(() => null);
+      });
+      speakerRef.current = speaker;
 
-      const msgs = useAppStore.getState().messages;
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant' && last.content) {
-        setVoicePhase('speaking');
-        const tts = useTtsStore.getState();
-        tts.markAutoSpoken(last.id); // keep chat autoplay from speaking it twice
-        if (tts.speakingId !== last.id) await tts.speak(last.id, last.content);
-        await waitForTtsIdle();
+      let replyId: string | null = null;
+      const feed = setInterval(() => {
+        const msgs = useAppStore.getState().messages;
+        const last = msgs[msgs.length - 1];
+        if (last?.role !== 'assistant') return;
+        if (replyId !== last.id) {
+          replyId = last.id;
+          useTtsStore.getState().markAutoSpoken(last.id); // no double read-aloud
+        }
+        speaker.update(last.content);
+      }, 120);
+      try {
+        await sendRef.current(text);
+      } finally {
+        clearInterval(feed);
+      }
+      if (!barge.hit) {
+        const msgs = useAppStore.getState().messages;
+        const last = msgs[msgs.length - 1];
+        speaker.finish(last?.role === 'assistant' ? last.content : '');
+      }
+      await speaker.idle;
+      speakerRef.current = null;
+      if (barge.hit && barge.promise) {
+        pending = await barge.promise; // keeps recording until the user pauses
+        echoOf = speaker.spokenText;
+      } else {
+        bargeAc.abort();
+        if (barge.promise) await barge.promise;
       }
     }
     listenAbortRef.current = null;
+    speakerRef.current = null;
     setVoiceLevel(0);
     setVoicePhase('idle');
     if (voiceModeRef.current) {
@@ -662,11 +750,14 @@ export function InputArea() {
       voiceModeRef.current = false;
       setVoiceMode(false);
       listenAbortRef.current?.abort();
+      speakerRef.current?.stop();
       useTtsStore.getState().stop();
       return;
     }
     voiceModeRef.current = true;
     setVoiceMode(true);
+    // Listing models makes the Claude engine pre-start its CLI process.
+    fetch(`${getBase()}/v1/models`).catch(() => {});
     void runVoiceLoop();
   }, [runVoiceLoop]);
 
@@ -674,6 +765,7 @@ export function InputArea() {
   useEffect(() => () => {
     voiceModeRef.current = false;
     listenAbortRef.current?.abort();
+    speakerRef.current?.stop();
   }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -799,7 +891,7 @@ export function InputArea() {
         {voiceMode ? (
           <button
             type="button"
-            onClick={() => voicePhase === 'speaking' && useTtsStore.getState().stop()}
+            onClick={() => voicePhase === 'speaking' && speakerRef.current?.stop()}
             className="bg-transparent"
             style={{
               color: 'var(--color-accent)',
